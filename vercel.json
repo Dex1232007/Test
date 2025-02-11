@@ -1,1 +1,14 @@
-
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/join_vc.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "env": {
+    "API_ID": "20085948",
+    "API_HASH": "3c513217d7d2ddf81caad5bbc4b55781",
+    "BOT_TOKEN": "6985125524:AAFz5E8Ia3hjtPzA9rb_71PQX5nHtic91WQ"
+  }
+  
