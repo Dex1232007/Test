@@ -1,0 +1,5 @@
+fastapi
+pyrogram
+pytgcalls
+uvicorn
+python-dotenv
