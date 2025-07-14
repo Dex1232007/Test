@@ -22,19 +22,20 @@ app.add_middleware(
 
 # Configuration
 DOWNLOAD_DIR = "youtube_downloads"
-COOKIES_FILE = "cookies.txt"  # Path to your cookies file
-RATE_LIMIT = 5  # Max downloads per minute per IP
+RATE_LIMIT = 3  # Max downloads per minute per IP
 Path(DOWNLOAD_DIR).mkdir(exist_ok=True)
 
 # Rate limiting storage
 download_times: Dict[str, list] = {}
 
 def is_valid_youtube_url(url: str) -> bool:
-    """Validate YouTube URL"""
+    """Validate YouTube URL with more patterns"""
     patterns = [
-        r"^https?://(www\.)?youtube\.com/watch\?v=[\w-]+",
-        r"^https?://youtu\.be/[\w-]+",
-        r"^https?://(www\.)?youtube\.com/shorts/[\w-]+"
+        r"^(https?://)?(www\.)?youtube\.com/watch\?v=[\w-]+",
+        r"^(https?://)?youtu\.be/[\w-]+",
+        r"^(https?://)?(www\.)?youtube\.com/shorts/[\w-]+",
+        r"^(https?://)?(www\.)?youtube\.com/embed/[\w-]+",
+        r"^(https?://)?(www\.)?youtube\.com/live/[\w-]+"
     ]
     return any(re.match(pattern, url) for pattern in patterns)
 
@@ -54,14 +55,18 @@ def check_rate_limit(ip: str) -> bool:
     return True
 
 def download_video(url: str, quality: str = "best") -> str:
-    """Download video using yt-dlp with error handling"""
+    """Download video using yt-dlp without cookies"""
     try:
         cmd = [
             "yt-dlp",
-            "--cookies", COOKIES_FILE,
-            "--limit-rate", "5M",  # Limit download speed
-            "--sleep-interval", "5",  # Add delay between requests
-            "--max-sleep-interval", "10",
+            "--extractor-args", "youtube:skip=webpage",  # Skip webpage check
+            "--throttled-rate", "1M",  # Limit download speed
+            "--sleep-interval", "10",  # Add delay between requests
+            "--max-sleep-interval", "30",
+            "--force-ipv4",  # Force IPv4 to avoid some blocks
+            "--geo-bypass",  # Bypass geographic restrictions
+            "--no-check-certificate",  # Avoid SSL issues
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "-f", f"bestvideo[height<={quality}]+bestaudio/best" if quality != "best" else "best",
             "-o", f"{DOWNLOAD_DIR}/%(title).200s [%(id)s].%(ext)s",
             "--no-playlist",
@@ -87,17 +92,14 @@ def download_video(url: str, quality: str = "best") -> str:
     except subprocess.CalledProcessError as e:
         error_msg = e.stderr or "Unknown error occurred"
         if "HTTP Error 429" in error_msg:
-            raise HTTPException(
-                status_code=429,
-                detail="YouTube is rate limiting us. Please try again later."
-            )
+            raise Exception("YouTube is rate limiting us. Please try again later.")
         raise Exception(error_msg)
     except Exception as e:
         raise Exception(f"Download failed: {str(e)}")
 
 @app.get("/download")
-async def download_endpoint(request: Request, url: str, quality: str = "1080"):
-    """Download YouTube video endpoint"""
+async def download_endpoint(request: Request, url: str, quality: str = "720"):
+    """Download YouTube video endpoint without cookies"""
     # Validate URL
     if not is_valid_youtube_url(url):
         raise HTTPException(status_code=400, detail="Invalid YouTube URL")
