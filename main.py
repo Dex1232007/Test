@@ -1,135 +1,134 @@
-#!/usr/bin/env python3
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pathlib import Path
+from typing import Optional
+import yt_dlp as youtube_dl
 import os
-import re
-import subprocess
-import time
-from datetime import datetime, timedelta
-from typing import Dict
+import uuid
+from pathlib import Path
+import shutil
 
-app = FastAPI()
+app = FastAPI(
+    title="YouTube Downloader API",
+    description="API for downloading YouTube videos as MP4 or MP3",
+    version="1.0.0"
+)
 
-# Enable CORS
+# CORS settings to allow all origins (adjust for production)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configuration
-DOWNLOAD_DIR = "youtube_downloads"
-COOKIES_FILE = "cookies.txt"  # Path to your cookies file
-RATE_LIMIT = 5  # Max downloads per minute per IP
-Path(DOWNLOAD_DIR).mkdir(exist_ok=True)
+# Configuration for downloads
+DOWNLOAD_FOLDER = "/tmp/downloads"
+Path(DOWNLOAD_FOLDER).mkdir(exist_ok=True)
 
-# Rate limiting storage
-download_times: Dict[str, list] = {}
+def sanitize_filename(filename: str) -> str:
+    """Remove invalid characters from filename"""
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        filename = filename.replace(char, '')
+    return filename
 
-def is_valid_youtube_url(url: str) -> bool:
-    """Validate YouTube URL"""
-    patterns = [
-        r"^https?://(www\.)?youtube\.com/watch\?v=[\w-]+",
-        r"^https?://youtu\.be/[\w-]+",
-        r"^https?://(www\.)?youtube\.com/shorts/[\w-]+"
-    ]
-    return any(re.match(pattern, url) for pattern in patterns)
-
-def check_rate_limit(ip: str) -> bool:
-    """Check if IP has exceeded rate limit"""
-    now = datetime.now()
-    if ip not in download_times:
-        download_times[ip] = []
+def get_video_info(url: str) -> dict:
+    """Get video information using yt-dlp"""
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'extract_flat': False,
+    }
     
-    # Remove old timestamps
-    download_times[ip] = [t for t in download_times[ip] if now - t < timedelta(minutes=1)]
-    
-    if len(download_times[ip]) >= RATE_LIMIT:
-        return False
-    
-    download_times[ip].append(now)
-    return True
-
-def download_video(url: str, quality: str = "best") -> str:
-    """Download video using yt-dlp with error handling"""
     try:
-        cmd = [
-            "yt-dlp",
-            "--cookies", COOKIES_FILE,
-            "--limit-rate", "5M",  # Limit download speed
-            "--sleep-interval", "5",  # Add delay between requests
-            "--max-sleep-interval", "10",
-            "-f", f"bestvideo[height<={quality}]+bestaudio/best" if quality != "best" else "best",
-            "-o", f"{DOWNLOAD_DIR}/%(title).200s [%(id)s].%(ext)s",
-            "--no-playlist",
-            "--no-warnings",
-            url
-        ]
-        
-        result = subprocess.run(
-            cmd, 
-            capture_output=True, 
-            text=True, 
-            timeout=600,
-            check=True
-        )
-        
-        # Find downloaded file
-        for line in result.stdout.split('\n'):
-            if line.startswith('[download] Destination: '):
-                return line.split('[download] Destination: ')[1].strip()
-        
-        raise Exception("Downloaded file path not found in output")
-        
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr or "Unknown error occurred"
-        if "HTTP Error 429" in error_msg:
-            raise HTTPException(
-                status_code=429,
-                detail="YouTube is rate limiting us. Please try again later."
-            )
-        raise Exception(error_msg)
+        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return {
+                'title': info.get('title', 'Untitled'),
+                'duration': info.get('duration', 0),
+                'thumbnail': info.get('thumbnail', ''),
+                'uploader': info.get('uploader', 'Unknown'),
+                'view_count': info.get('view_count', 0),
+                'webpage_url': info.get('webpage_url', url),
+            }
     except Exception as e:
-        raise Exception(f"Download failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Error fetching video info: {str(e)}")
+
+def download_youtube_video(url: str, format: str = 'mp4') -> str:
+    """Download YouTube video and return the file path"""
+    unique_id = str(uuid.uuid4())
+    
+    if format == 'mp3':
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'outtmpl': f'{DOWNLOAD_FOLDER}/{unique_id}.%(ext)s',
+            'quiet': True,
+        }
+    else:  # mp4
+        ydl_opts = {
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'outtmpl': f'{DOWNLOAD_FOLDER}/{unique_id}.%(ext)s',
+            'quiet': True,
+        }
+    
+    try:
+        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            
+            if format == 'mp3':
+                filename = filename.rsplit('.', 1)[0] + '.mp3'
+            
+            return filename
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error downloading video: {str(e)}")
+
+@app.get("/")
+async def read_root():
+    return {"message": "YouTube Downloader API is running"}
+
+@app.get("/info")
+async def get_info(url: str = Query(..., description="YouTube video URL")):
+    """Get information about a YouTube video"""
+    return get_video_info(url)
 
 @app.get("/download")
-async def download_endpoint(request: Request, url: str, quality: str = "1080"):
-    """Download YouTube video endpoint"""
-    # Validate URL
-    if not is_valid_youtube_url(url):
-        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+async def download(
+    url: str = Query(..., description="YouTube video URL"),
+    format: str = Query('mp4', description="Output format (mp3 or mp4)", regex="^(mp3|mp4)$")
+):
+    """Download YouTube video as MP3 or MP4"""
+    video_info = get_video_info(url)
+    filename = download_youtube_video(url, format)
     
-    # Check rate limit
-    client_ip = request.client.host or "unknown"
-    if not check_rate_limit(client_ip):
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded. Max {RATE_LIMIT} downloads per minute."
-        )
+    # Generate a clean filename for the download
+    clean_title = sanitize_filename(video_info['title'])
+    output_filename = f"{clean_title}.{format}"
     
-    try:
-        filepath = download_video(url, quality)
-        if not os.path.exists(filepath):
-            raise HTTPException(status_code=500, detail="Downloaded file not found")
-        
-        filename = os.path.basename(filepath)
-        return FileResponse(
-            filepath,
-            media_type="application/octet-stream",
-            filename=filename
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    # Return the file for download
+    response = FileResponse(
+        filename,
+        media_type='audio/mpeg' if format == 'mp3' else 'video/mp4',
+        filename=output_filename
+    )
+    
+    # Clean up after sending the file
+    @response.on_close
+    def cleanup():
+        try:
+            os.remove(filename)
+        except:
+            pass
+    
+    return response
 
 if __name__ == "__main__":
     import uvicorn
