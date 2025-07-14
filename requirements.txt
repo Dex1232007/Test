@@ -1,4 +1,4 @@
-fastapi
-uvicorn
-yt-dlp
-python-multipart
+fastapi==0.95.2
+uvicorn==0.22.0
+python-multipart==0.0.6
+yt-dlp==2023.07.06
