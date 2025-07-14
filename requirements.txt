@@ -1,4 +1,4 @@
-flask
-werkzeug
-pyperclip
+fastapi
+uvicorn
 yt-dlp
+python-multipart
