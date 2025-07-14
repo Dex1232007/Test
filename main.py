@@ -1,61 +1,135 @@
 #!/usr/bin/env python3
-# FastAPI Version (No Flask)
-
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pathlib import Path
 import os
 import re
 import subprocess
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
-from pathlib import Path
+import time
+from datetime import datetime, timedelta
+from typing import Dict
 
 app = FastAPI()
 
-# Config
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+# Configuration
 DOWNLOAD_DIR = "youtube_downloads"
+COOKIES_FILE = "cookies.txt"  # Path to your cookies file
+RATE_LIMIT = 5  # Max downloads per minute per IP
 Path(DOWNLOAD_DIR).mkdir(exist_ok=True)
 
+# Rate limiting storage
+download_times: Dict[str, list] = {}
+
 def is_valid_youtube_url(url: str) -> bool:
-    pattern = r"^https?://(www\.|m\.)?(youtube\.com|youtu\.be)/.+"
-    return re.match(pattern, url) is not None
+    """Validate YouTube URL"""
+    patterns = [
+        r"^https?://(www\.)?youtube\.com/watch\?v=[\w-]+",
+        r"^https?://youtu\.be/[\w-]+",
+        r"^https?://(www\.)?youtube\.com/shorts/[\w-]+"
+    ]
+    return any(re.match(pattern, url) for pattern in patterns)
+
+def check_rate_limit(ip: str) -> bool:
+    """Check if IP has exceeded rate limit"""
+    now = datetime.now()
+    if ip not in download_times:
+        download_times[ip] = []
+    
+    # Remove old timestamps
+    download_times[ip] = [t for t in download_times[ip] if now - t < timedelta(minutes=1)]
+    
+    if len(download_times[ip]) >= RATE_LIMIT:
+        return False
+    
+    download_times[ip].append(now)
+    return True
 
 def download_video(url: str, quality: str = "best") -> str:
+    """Download video using yt-dlp with error handling"""
     try:
         cmd = [
             "yt-dlp",
+            "--cookies", COOKIES_FILE,
+            "--limit-rate", "5M",  # Limit download speed
+            "--sleep-interval", "5",  # Add delay between requests
+            "--max-sleep-interval", "10",
             "-f", f"bestvideo[height<={quality}]+bestaudio/best" if quality != "best" else "best",
-            "-o", f"{DOWNLOAD_DIR}/%(title)s.%(ext)s",
+            "-o", f"{DOWNLOAD_DIR}/%(title).200s [%(id)s].%(ext)s",
             "--no-playlist",
+            "--no-warnings",
             url
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         
-        if result.returncode == 0:
-            for line in result.stdout.split('\n'):
-                if line.startswith('[download] Destination: '):
-                    return line.split('[download] Destination: ')[1].strip()
-        raise Exception(result.stderr)
+        result = subprocess.run(
+            cmd, 
+            capture_output=True, 
+            text=True, 
+            timeout=600,
+            check=True
+        )
+        
+        # Find downloaded file
+        for line in result.stdout.split('\n'):
+            if line.startswith('[download] Destination: '):
+                return line.split('[download] Destination: ')[1].strip()
+        
+        raise Exception("Downloaded file path not found in output")
+        
+    except subprocess.CalledProcessError as e:
+        error_msg = e.stderr or "Unknown error occurred"
+        if "HTTP Error 429" in error_msg:
+            raise HTTPException(
+                status_code=429,
+                detail="YouTube is rate limiting us. Please try again later."
+            )
+        raise Exception(error_msg)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise Exception(f"Download failed: {str(e)}")
 
 @app.get("/download")
-async def download_endpoint(url: str, quality: str = "1080"):
+async def download_endpoint(request: Request, url: str, quality: str = "1080"):
+    """Download YouTube video endpoint"""
+    # Validate URL
     if not is_valid_youtube_url(url):
         raise HTTPException(status_code=400, detail="Invalid YouTube URL")
     
+    # Check rate limit
+    client_ip = request.client.host or "unknown"
+    if not check_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded. Max {RATE_LIMIT} downloads per minute."
+        )
+    
     try:
         filepath = download_video(url, quality)
+        if not os.path.exists(filepath):
+            raise HTTPException(status_code=500, detail="Downloaded file not found")
+        
         filename = os.path.basename(filepath)
         return FileResponse(
             filepath,
             media_type="application/octet-stream",
             filename=filename
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    """Health check endpoint"""
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 if __name__ == "__main__":
     import uvicorn
