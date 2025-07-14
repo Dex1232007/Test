@@ -1,120 +1,73 @@
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-import yt_dlp as youtube_dl
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from typing import Optional
+import subprocess
 import os
 import uuid
-from pathlib import Path
 
-app = FastAPI(
-    title="YouTube Downloader API",
-    description="Download YouTube videos (MP4/MP3)",
-    version="1.0.0"
-)
+app = FastAPI()
 
-# CORS for frontend access
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Directories
+DOWNLOAD_DIR = "downloads"
+COOKIES_FILE = "cookies.txt"
 
-# Download directory
-DOWNLOAD_FOLDER = "/tmp/downloads"
-Path(DOWNLOAD_FOLDER).mkdir(exist_ok=True)
+# Ensure folder exists
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Cookies file path
-COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
-
-def sanitize_filename(filename: str) -> str:
-    return ''.join(c for c in filename if c not in '<>:"/\\|?*')
-
-def get_video_info(url: str) -> dict:
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'cookiefile': COOKIES_FILE,
-    }
-    try:
-        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return {
-                'title': info.get('title', 'Untitled'),
-                'duration': info.get('duration', 0),
-                'thumbnail': info.get('thumbnail', ''),
-                'uploader': info.get('uploader', 'Unknown'),
-                'view_count': info.get('view_count', 0),
-                'webpage_url': info.get('webpage_url', url),
-            }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error fetching video info: {str(e)}")
-
-def download_youtube_video(url: str, format: str = 'mp4') -> str:
-    unique_id = str(uuid.uuid4())
-    output_path = f"{DOWNLOAD_FOLDER}/{unique_id}.%(ext)s"
-
-    if format == 'mp3':
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'cookiefile': COOKIES_FILE,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            'outtmpl': output_path,
-            'quiet': True,
-        }
-    else:  # mp4
-        ydl_opts = {
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-            'cookiefile': COOKIES_FILE,
-            'outtmpl': output_path,
-            'quiet': True,
-        }
-
-    try:
-        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if format == 'mp3':
-                filename = filename.rsplit('.', 1)[0] + '.mp3'
-            return filename
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error downloading video: {str(e)}")
+# Serve static files
+app.mount("/files", StaticFiles(directory=DOWNLOAD_DIR), name="files")
 
 @app.get("/")
-async def root():
-    return {"message": "YouTube Downloader API is running"}
-
-@app.get("/info")
-async def info(url: str = Query(..., description="YouTube URL")):
-    return get_video_info(url)
+def home():
+    return {"message": "YouTube Downloader API is running."}
 
 @app.get("/download")
-async def download(
-    url: str = Query(..., description="YouTube video URL"),
-    format: str = Query("mp4", regex="^(mp3|mp4)$", description="Output format")
+def download_video(
+    request: Request,
+    url: str = Query(..., description="YouTube URL"),
+    format: Optional[str] = Query("mp4", description="Format: mp4 or mp3")
 ):
-    video_info = get_video_info(url)
-    file_path = download_youtube_video(url, format)
-    filename = f"{sanitize_filename(video_info['title'])}.{format}"
+    # Validate cookies.txt exists
+    if not os.path.exists(COOKIES_FILE):
+        return JSONResponse(status_code=500, content={"error": "cookies.txt not found on server."})
 
-    response = FileResponse(
-        path=file_path,
-        media_type="audio/mpeg" if format == "mp3" else "video/mp4",
-        filename=filename
-    )
+    # Create unique ID filename
+    video_id = str(uuid.uuid4())
+    output_template = os.path.join(DOWNLOAD_DIR, f"{video_id}.%(ext)s")
 
-    @response.on_close
-    def cleanup():
-        try:
-            os.remove(file_path)
-        except:
-            pass
+    # Base yt-dlp command
+    cmd = [
+        "yt-dlp",
+        "--cookies", COOKIES_FILE,
+        "-o", output_template,
+        url
+    ]
 
-    return response
+    # Format logic
+    if format == "mp3":
+        cmd += ["--extract-audio", "--audio-format", "mp3"]
+    elif format == "mp4":
+        cmd += ["-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4"]
+
+    # Run yt-dlp
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError as e:
+        return JSONResponse(status_code=500, content={
+            "error": "Download failed",
+            "detail": str(e)
+        })
+
+    # Find downloaded file
+    for file in os.listdir(DOWNLOAD_DIR):
+        if file.startswith(video_id):
+            full_url = str(request.base_url) + f"files/{file}"
+            return {
+                "status": "success",
+                "format": format,
+                "filename": file,
+                "download_url": full_url
+            }
+
+    return JSONResponse(status_code=500, content={"error": "File not found"})
