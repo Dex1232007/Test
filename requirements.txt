@@ -1,5 +1,4 @@
-fastapi
-pyrogram
-pytgcalls
-uvicorn
-python-dotenv
+flask
+werkzeug
+pyperclip
+yt-dlp
